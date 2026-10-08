@@ -1,0 +1,104 @@
+[package]
+name = "flowsurface"
+version.workspace = true
+readme = "README.md"
+license = "GPL-3.0-or-later"
+description = "A native desktop terminal for crypto order flow and options analytics"
+categories = ["finance", "visualization", "gui"]
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[workspace.package]
+version = "0.8.9"
+edition = "2024"
+repository = "https://github.com/Niketion/flowdepth"
+homepage = "https://github.com/Niketion/flowdepth"
+
+[workspace]
+members = [ "data", "exchange"]
+
+[workspace.dependencies]
+iced_core = { git = "https://github.com/iced-rs/iced.git", rev = "2b275718d19a5cf306537e1d2417a1f5e9d94ef4", features = ["serde"] }
+chrono = { version = "0.4.44", default-features = false, features = ["serde", "now", "clock"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive"] }
+serde_json = "1.0.149"
+log = "0.4.29"
+thiserror = "2.0.18"
+regex = "1.12.3"
+palette = "0.7.6"
+num-traits = "0.2.19"
+rustc-hash = "2.1.2"
+enum-map = "2.7.3"
+url = "2.5.8"
+rand = "0.10.1"
+uuid = { version = "1.23.1", features = ["v4"] }
+data = { version = "0.8.9", path = "data", package = "flowsurface-data" }
+exchange = { version = "0.8.9", path = "exchange", package = "flowsurface-exchange" }
+arrow-ipc = { version = "59.1", default-features = false }
+arrow-array = { version = "59.1", default-features = false }
+arrow-schema = { version = "59.1", default-features = false }
+reqwest = { version = "0.12.28", default-features = false, features = ["cookies", "json", "rustls-tls"] }
+
+[dependencies]
+iced = { git = "https://github.com/iced-rs/iced.git", rev = "2b275718d19a5cf306537e1d2417a1f5e9d94ef4", default-features = false, features = [
+    "wgpu",
+    "tokio",
+    "canvas",
+    "image",
+    "svg",
+    "sipper",
+    "advanced",
+    "unconditional-rendering",
+    "crisp",
+    "x11",
+    "wayland",
+] }
+iced_core.workspace = true
+chrono.workspace = true
+chrono-tz = "0.10.4"
+serde_json.workspace = true
+serde.workspace = true
+bincode = { version = "2.0.1", features = ["serde"] }
+redb = "4.1.0"
+thiserror.workspace = true
+log.workspace = true
+uuid.workspace = true
+palette.workspace = true
+num-traits.workspace = true
+rustc-hash.workspace = true
+enum-map.workspace = true
+url.workspace = true
+fern = "0.7.1"
+reqwest.workspace = true
+rodio = { version = "0.22.2", default-features = false, features = [ "playback", "wav" ]}
+tokio = { version = "1.52", default-features = false, features = ["time"] }
+gif = "0.14.2"
+image = { version = "0.25.10", default-features = false, features = ["ico"] }
+rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", "tokio"] }
+
+bytemuck = "1.25.0"
+iced_wgpu = { git = "https://github.com/iced-rs/iced.git", rev = "2b275718d19a5cf306537e1d2417a1f5e9d94ef4" }
+exchange.workspace = true
+arrow-ipc.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+bytes = "1.11.1"
+data.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Power",
+    "Win32_UI_HiDpi",
+] }
+
+[features]
+debug = ["iced/hot"]
+
+[build-dependencies]
+winresource = "0.1.31"
+
+[patch."https://github.com/iced-rs/winit.git"]
+winit = { git = "https://github.com/Niketion/winit.git", rev = "407f0d9498b3d842e8c2d6bfcaf06a73a3f65399" }

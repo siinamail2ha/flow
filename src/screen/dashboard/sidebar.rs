@@ -1,0 +1,634 @@
+use super::tickers_table::{self, TickersTable};
+use crate::{
+    TooltipPosition,
+    layout::SavedState,
+    style::{Icon, icon_text},
+    widget::button_with_tooltip,
+};
+use data::sidebar;
+
+use iced::{
+    Alignment, Element, Subscription, Task,
+    widget::responsive,
+    widget::{button, column, container, row, space, text, tooltip},
+};
+use rustc_hash::FxHashMap;
+
+const EXCHANGE_NAMES: [&str; 7] = [
+    "Binance",
+    "Linear Perps",
+    "Inverse Perps",
+    "Deribit",
+    "OKX",
+    "MEXC",
+    "Hyperliquid",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExchangePing {
+    pub name: String,
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl ExchangePing {
+    fn pending(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            latency_ms: None,
+            error: None,
+        }
+    }
+}
+
+fn apply_exchange_pings(
+    samples: &mut [ExchangePing],
+    results: impl IntoIterator<Item = (String, Result<u64, String>)>,
+) {
+    for (name, result) in results {
+        let Some(sample) = samples.iter_mut().find(|sample| sample.name == name) else {
+            continue;
+        };
+
+        match result {
+            Ok(latency_ms) => {
+                sample.latency_ms = Some(latency_ms);
+                sample.error = None;
+            }
+            Err(error) => {
+                sample.latency_ms = None;
+                sample.error = Some(error.chars().take(160).collect());
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    ToggleSidebarMenu(Option<sidebar::Menu>),
+    AddViewSelected(data::layout::pane::ContentKind),
+    SetSidebarPosition(sidebar::Position),
+    TickersTable(super::tickers_table::Message),
+}
+
+pub struct Sidebar {
+    pub state: data::Sidebar,
+    pub tickers_table: TickersTable,
+    exchange_pings: Vec<ExchangePing>,
+}
+
+pub enum Action {
+    AddViewSelected(data::layout::pane::ContentKind),
+    TickerSelected(
+        exchange::TickerInfo,
+        Option<data::layout::pane::ContentKind>,
+    ),
+    ErrorOccurred(data::InternalError),
+    MenuChanged(Option<sidebar::Menu>),
+}
+
+impl Sidebar {
+    pub fn new(
+        state: &SavedState,
+        handles: exchange::adapter::AdapterHandles,
+    ) -> (Self, Task<Message>) {
+        let metadata = data::MarketMetadata::with_cache_enabled(state.cache_market_metadata);
+
+        let (tickers_table, initial_fetch) =
+            if let Some(settings) = state.sidebar.tickers_table.as_ref() {
+                TickersTable::new_with_settings(settings, handles.clone(), metadata)
+            } else {
+                TickersTable::new(handles, metadata)
+            };
+
+        (
+            Self {
+                state: state.sidebar.clone(),
+                tickers_table,
+                exchange_pings: EXCHANGE_NAMES
+                    .iter()
+                    .map(|name| ExchangePing::pending(name))
+                    .collect(),
+            },
+            initial_fetch.map(Message::TickersTable),
+        )
+    }
+
+    pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Action>) {
+        match message {
+            Message::ToggleSidebarMenu(menu) => {
+                if menu.is_some() {
+                    self.tickers_table.is_shown = false;
+                }
+                let new_menu = menu.filter(|&m| !self.is_menu_active(m));
+                self.set_menu(new_menu);
+                return (Task::none(), Some(Action::MenuChanged(new_menu)));
+            }
+            Message::AddViewSelected(kind) => {
+                self.set_menu(None);
+                return (Task::none(), Some(Action::AddViewSelected(kind)));
+            }
+            Message::SetSidebarPosition(position) => {
+                self.state.position = position;
+            }
+            Message::TickersTable(msg) => {
+                if matches!(msg, super::tickers_table::Message::ToggleTable) {
+                    self.set_menu(None);
+                }
+                let action = self.tickers_table.update(msg);
+
+                match action {
+                    Some(tickers_table::Action::TickerSelected(ticker_info, content)) => {
+                        return (
+                            Task::none(),
+                            Some(Action::TickerSelected(ticker_info, content)),
+                        );
+                    }
+                    Some(tickers_table::Action::Fetch(task)) => {
+                        return (task.map(Message::TickersTable), None);
+                    }
+                    Some(tickers_table::Action::ErrorOccurred(error)) => {
+                        return (Task::none(), Some(Action::ErrorOccurred(error)));
+                    }
+                    Some(tickers_table::Action::FocusWidget(id)) => {
+                        return (iced::widget::operation::focus(id), None);
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        (Task::none(), None)
+    }
+
+    pub fn view(
+        &self,
+        audio_volume: Option<f32>,
+        connectivity: crate::market_service::ConnectivityPhase,
+        connected_count: usize,
+        expected_count: usize,
+    ) -> Element<'_, Message> {
+        let state = &self.state;
+
+        let tooltip_position = if state.position == sidebar::Position::Left {
+            TooltipPosition::Right
+        } else {
+            TooltipPosition::Left
+        };
+
+        let is_table_open = self.tickers_table.is_shown;
+
+        let nav_buttons = self.nav_buttons(
+            is_table_open,
+            audio_volume,
+            connectivity,
+            connected_count,
+            expected_count,
+            tooltip_position,
+        );
+
+        let tickers_table = if is_table_open {
+            column![responsive(move |size| self
+                .tickers_table
+                .view(size)
+                .map(Message::TickersTable))]
+            .width(200)
+        } else {
+            column![]
+        };
+
+        match state.position {
+            sidebar::Position::Left => row![nav_buttons, tickers_table],
+            sidebar::Position::Right => row![tickers_table, nav_buttons],
+        }
+        .spacing(if is_table_open { 8 } else { 4 })
+        .into()
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        self.tickers_table.subscription().map(Message::TickersTable)
+    }
+
+    fn nav_buttons(
+        &self,
+        is_table_open: bool,
+        audio_volume: Option<f32>,
+        connectivity: crate::market_service::ConnectivityPhase,
+        connected_count: usize,
+        expected_count: usize,
+        tooltip_position: TooltipPosition,
+    ) -> iced::widget::Column<'_, Message> {
+        let settings_modal_button = {
+            let is_active = self.is_menu_active(sidebar::Menu::Settings)
+                || self.is_menu_active(sidebar::Menu::ThemeEditor);
+
+            button_with_tooltip(
+                icon_text(Icon::Cog, 14)
+                    .width(26)
+                    .height(26)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
+                Message::ToggleSidebarMenu(Some(sidebar::Menu::Settings)),
+                Some("Settings"),
+                tooltip_position,
+                move |theme, status| crate::style::button::toolbar(theme, status, is_active),
+            )
+        };
+
+        let layout_modal_button = {
+            let is_active = self.is_menu_active(sidebar::Menu::Layout);
+
+            button_with_tooltip(
+                icon_text(Icon::Layout, 14)
+                    .width(26)
+                    .height(26)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
+                Message::ToggleSidebarMenu(Some(sidebar::Menu::Layout)),
+                Some("Dashboard layouts"),
+                tooltip_position,
+                move |theme, status| crate::style::button::toolbar(theme, status, is_active),
+            )
+        };
+
+        let ticker_search_button = {
+            button_with_tooltip(
+                icon_text(Icon::Search, 14)
+                    .width(26)
+                    .height(26)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
+                Message::TickersTable(super::tickers_table::Message::ToggleTable),
+                Some("Markets"),
+                tooltip_position,
+                move |theme, status| crate::style::button::toolbar(theme, status, is_table_open),
+            )
+        };
+
+        let add_view_button = {
+            let is_active = self.is_menu_active(sidebar::Menu::AddView);
+            button_with_tooltip(
+                text("+")
+                    .size(24)
+                    .width(26)
+                    .height(26)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
+                Message::ToggleSidebarMenu(Some(sidebar::Menu::AddView)),
+                Some("Add view"),
+                tooltip_position,
+                move |theme, status| {
+                    crate::style::button::toolbar_primary(theme, status, is_active)
+                },
+            )
+        };
+
+        let audio_btn = {
+            let is_active = self.is_menu_active(sidebar::Menu::Audio);
+
+            let icon = match audio_volume.unwrap_or(0.0) {
+                v if v >= 40.0 => Icon::SpeakerHigh,
+                v if v > 0.0 => Icon::SpeakerLow,
+                _ => Icon::SpeakerOff,
+            };
+
+            button_with_tooltip(
+                icon_text(icon, 14)
+                    .width(26)
+                    .height(26)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
+                Message::ToggleSidebarMenu(Some(sidebar::Menu::Audio)),
+                Some("Audio"),
+                tooltip_position,
+                move |theme, status| crate::style::button::toolbar(theme, status, is_active),
+            )
+        };
+
+        let connection_btn: Element<'_, Message> = {
+            let is_active = self.is_menu_active(sidebar::Menu::Network);
+            let state = match connectivity {
+                crate::market_service::ConnectivityPhase::Online => "Online",
+                crate::market_service::ConnectivityPhase::Connecting => "Connecting",
+                crate::market_service::ConnectivityPhase::Offline => "Offline",
+            };
+            let label: iced::widget::Text<'_, iced::Theme, iced::Renderer> = text("●")
+                .size(14)
+                .width(26)
+                .height(26)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
+                .style(move |theme: &iced::Theme| iced::widget::text::Style {
+                    color: Some(match connectivity {
+                        crate::market_service::ConnectivityPhase::Online => {
+                            theme.palette().success.base.color
+                        }
+                        crate::market_service::ConnectivityPhase::Connecting => {
+                            theme.palette().warning.base.color
+                        }
+                        crate::market_service::ConnectivityPhase::Offline => {
+                            theme.palette().danger.base.color
+                        }
+                    }),
+                });
+            let btn = button(label)
+                .on_press(Message::ToggleSidebarMenu(Some(sidebar::Menu::Network)))
+                .style(move |theme, status| {
+                    crate::style::button::toolbar(theme, status, is_active)
+                });
+            let details = if expected_count > 0 {
+                format!("Connection status: {state} ({connected_count}/{expected_count})")
+            } else {
+                format!("Connection status: {state}")
+            };
+            tooltip(
+                btn,
+                container(text(details))
+                    .style(crate::style::tooltip)
+                    .padding(8),
+                tooltip_position,
+            )
+            .into()
+        };
+
+        let exchange_btn = {
+            let is_active = self.is_menu_active(sidebar::Menu::Exchange);
+            button_with_tooltip(
+                icon_text(Icon::Refresh, 14)
+                    .width(26)
+                    .height(26)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
+                Message::ToggleSidebarMenu(Some(sidebar::Menu::Exchange)),
+                Some("Network health and exchange latency"),
+                tooltip_position,
+                move |theme, status| crate::style::button::toolbar(theme, status, is_active),
+            )
+        };
+
+        column![
+            ticker_search_button,
+            add_view_button,
+            layout_modal_button,
+            space::vertical(),
+            audio_btn,
+            connection_btn,
+            exchange_btn,
+            settings_modal_button,
+        ]
+        .width(40)
+        .spacing(4)
+    }
+
+    pub fn set_exchange_pings(&mut self, results: Vec<(String, Result<u64, String>)>) {
+        apply_exchange_pings(&mut self.exchange_pings, results);
+    }
+
+    pub fn view_exchange_panel(&self) -> Element<'_, Message> {
+        use iced::{Border, Color, Length};
+
+        let measured = self
+            .exchange_pings
+            .iter()
+            .filter(|sample| sample.latency_ms.is_some())
+            .count();
+        let total = self.exchange_pings.len();
+
+        let header = row![
+            column![
+                text("Network health").size(crate::style::text_size::TITLE),
+                text("REST round-trip latency")
+                    .size(crate::style::text_size::SMALL)
+                    .style(crate::style::secondary_text),
+            ]
+            .spacing(2),
+            space::horizontal(),
+            text(format!("{measured}/{total}"))
+                .size(crate::style::text_size::EMPHASIS)
+                .style(|theme: &iced::Theme| iced::widget::text::Style {
+                    color: Some(theme.palette().primary.base.color),
+                }),
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+
+        let summary = container(
+            row![
+                text(if measured == total {
+                    "All venues reachable"
+                } else {
+                    "Waiting for samples"
+                })
+                .size(crate::style::text_size::SMALL),
+                space::horizontal(),
+                text("Auto refresh · 10s")
+                    .size(crate::style::text_size::TINY)
+                    .style(crate::style::secondary_text),
+            ]
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([7, 9])
+        .style(crate::style::exchange_summary);
+
+        let rows = self.exchange_pings.iter().map(|sample| {
+            let (state, tone) = match (sample.latency_ms, sample.error.is_some()) {
+                (_, true) => ("Unavailable", "error"),
+                (None, false) => ("Waiting", "waiting"),
+                (Some(ms), false) if ms < 150 => ("Healthy", "healthy"),
+                (Some(ms), false) if ms <= 400 => ("Elevated", "elevated"),
+                (Some(_), false) => ("Slow", "slow"),
+            };
+            let latency = sample
+                .latency_ms
+                .map_or_else(|| "—".to_owned(), |ms| format!("{ms} ms"));
+            let tone_for_dot = tone;
+            let dot =
+                text("●")
+                    .size(10)
+                    .style(move |theme: &iced::Theme| iced::widget::text::Style {
+                        color: Some(match tone_for_dot {
+                            "healthy" => theme.palette().success.base.color,
+                            "elevated" => theme.palette().warning.base.color,
+                            "slow" | "error" => theme.palette().danger.base.color,
+                            _ => theme.palette().secondary.weak.color,
+                        }),
+                    });
+            let name = column![
+                text(&sample.name).size(crate::style::text_size::BODY),
+                text(state)
+                    .size(crate::style::text_size::TINY)
+                    .style(crate::style::secondary_text),
+            ]
+            .spacing(1)
+            .width(Length::Fill);
+            let tone_for_pill = tone;
+            let ping_pill = container(text(latency).size(crate::style::text_size::SMALL))
+                .padding([4, 8])
+                .style(move |theme: &iced::Theme| {
+                    let color = match tone_for_pill {
+                        "healthy" => theme.palette().success.base.color,
+                        "elevated" => theme.palette().warning.base.color,
+                        "slow" | "error" => theme.palette().danger.base.color,
+                        _ => theme.palette().secondary.weak.color,
+                    };
+                    iced::widget::container::Style {
+                        text_color: Some(color),
+                        background: Some(
+                            Color {
+                                a: if theme.palette().is_dark { 0.16 } else { 0.10 },
+                                ..color
+                            }
+                            .into(),
+                        ),
+                        border: Border {
+                            width: 1.0,
+                            color: color.scale_alpha(0.45),
+                            radius: 6.0.into(),
+                        },
+                        ..Default::default()
+                    }
+                });
+            let ping: Element<'_, Message> = if let Some(error) = &sample.error {
+                tooltip(
+                    ping_pill,
+                    container(text(error.clone()))
+                        .style(crate::style::tooltip)
+                        .padding(8),
+                    TooltipPosition::Top,
+                )
+                .into()
+            } else {
+                ping_pill.into()
+            };
+
+            let row: Element<'_, Message> =
+                container(row![dot, name, ping].spacing(8).align_y(Alignment::Center))
+                    .width(Length::Fill)
+                    .padding([8, 9])
+                    .style(crate::style::exchange_row)
+                    .into();
+            row
+        });
+
+        container(
+            column![header, summary, iced::widget::Column::with_children(rows),]
+                .spacing(10)
+                .width(Length::Fill),
+        )
+        .width(Length::Fixed(330.0))
+        .padding(16)
+        .style(crate::style::dashboard_modal)
+        .into()
+    }
+
+    pub fn hide_tickers_table(&mut self) -> bool {
+        let table = &mut self.tickers_table;
+
+        if table.expand_ticker_card.is_some() {
+            table.expand_ticker_card = None;
+            return true;
+        } else if table.is_shown {
+            table.is_shown = false;
+            return true;
+        }
+
+        false
+    }
+
+    pub fn is_menu_active(&self, menu: sidebar::Menu) -> bool {
+        self.state.active_menu == Some(menu)
+    }
+
+    pub fn active_menu(&self) -> Option<sidebar::Menu> {
+        self.state.active_menu
+    }
+
+    pub fn position(&self) -> sidebar::Position {
+        self.state.position
+    }
+
+    pub fn set_menu(&mut self, menu: Option<sidebar::Menu>) {
+        self.state.active_menu = menu;
+    }
+
+    pub fn sync_tickers_table_settings(&mut self) {
+        let settings = &self.tickers_table.settings();
+        self.state.tickers_table = Some(settings.clone());
+    }
+
+    pub fn tickers_info(&self) -> &FxHashMap<exchange::Ticker, Option<exchange::TickerInfo>> {
+        self.tickers_table.metadata.tickers()
+    }
+
+    pub fn cache_enabled(&self) -> bool {
+        self.tickers_table.metadata.cache_enabled()
+    }
+
+    pub fn set_cache_enabled(&mut self, enabled: bool) {
+        self.tickers_table.metadata.set_cache_enabled(enabled);
+    }
+
+    pub fn force_refresh_metadata(&mut self) -> Option<Task<Message>> {
+        self.tickers_table
+            .force_refresh_metadata()
+            .map(|task| task.map(Message::TickersTable))
+    }
+
+    pub fn persist_metadata_cache(&self) {
+        if self.tickers_table.metadata.cache_enabled() {
+            self.tickers_table.metadata.save_to_file();
+        }
+    }
+
+    pub fn last_metadata_update(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.tickers_table.last_metadata_update()
+    }
+
+    pub fn is_metadata_loading(&self) -> bool {
+        self.tickers_table.is_metadata_loading()
+    }
+
+    pub fn metadata_loading_progress(&self) -> (usize, usize) {
+        self.tickers_table.metadata_loading_progress()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EXCHANGE_NAMES, ExchangePing, apply_exchange_pings};
+
+    fn samples() -> Vec<ExchangePing> {
+        EXCHANGE_NAMES
+            .iter()
+            .map(|name| ExchangePing::pending(name))
+            .collect()
+    }
+
+    #[test]
+    fn exchange_samples_keep_a_stable_venue_order() {
+        let samples = samples();
+
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.name.as_str())
+                .collect::<Vec<_>>(),
+            EXCHANGE_NAMES,
+        );
+    }
+
+    #[test]
+    fn exchange_sample_replaces_errors_and_bounds_error_text() {
+        let mut samples = samples();
+        let long_error = "x".repeat(400);
+
+        apply_exchange_pings(&mut samples, [("Binance".to_owned(), Err(long_error))]);
+        assert_eq!(samples[0].latency_ms, None);
+        assert_eq!(samples[0].error.as_ref().map(String::len), Some(160));
+
+        apply_exchange_pings(&mut samples, [("Binance".to_owned(), Ok(42))]);
+        assert_eq!(samples[0].latency_ms, Some(42));
+        assert_eq!(samples[0].error, None);
+    }
+}

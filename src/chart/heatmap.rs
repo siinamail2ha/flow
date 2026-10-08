@@ -1,0 +1,1417 @@
+use super::{Chart, Interaction, Message, PlotConstants, ViewState, ticks::y::PriceInfoLabel};
+use crate::{
+    modal::pane::settings::study::{self, Study},
+    style,
+};
+use data::chart::{
+    Basis, ViewConfig,
+    heatmap::{
+        CLEANUP_THRESHOLD, Config, GroupedTrade, HeatmapDataPoint, HeatmapStudy, HistoricalDepth,
+        ProfileKind, QtyScale,
+    },
+    indicator::HeatmapIndicator,
+};
+use data::orderflow::iceberg::{IcebergEvent, IcebergSide};
+use data::util::abbr_large_numbers;
+use data::{
+    aggr::time::{DataPoint, TimeSeries},
+    chart::Autoscale,
+};
+use exchange::{
+    SizeUnit, TickerInfo, Trade, UnixMs,
+    depth::Depth,
+    unit::{Price, PriceStep},
+};
+
+use iced::widget::canvas::{self, Event, Geometry, Path};
+use iced::{
+    Alignment, Color, Element, Point, Rectangle, Renderer, Size, Theme, Vector, mouse,
+    theme::Palette,
+};
+
+use enum_map::EnumMap;
+use rustc_hash::FxHashMap;
+use std::time::Instant;
+
+const MIN_SCALING: f32 = 0.6;
+const MAX_SCALING: f32 = 1.2;
+
+const MAX_CELL_WIDTH: f32 = 12.0;
+const MIN_CELL_WIDTH: f32 = 1.0;
+
+const MAX_CELL_HEIGHT: f32 = 10.0;
+const MIN_CELL_HEIGHT: f32 = 1.0;
+
+fn draw_trade_bubble(
+    frame: &mut canvas::Frame,
+    center: Point,
+    radius: f32,
+    color: Color,
+    three_dimensional: bool,
+    scaling: f32,
+) {
+    if !three_dimensional {
+        frame.fill(&Path::circle(center, radius), color);
+        return;
+    }
+
+    let shadow_offset = 2.5 / scaling.max(f32::EPSILON);
+    frame.fill(
+        &Path::circle(
+            Point::new(center.x + shadow_offset, center.y + shadow_offset * 1.2),
+            radius,
+        ),
+        Color::BLACK.scale_alpha(0.28),
+    );
+    frame.fill(&Path::circle(center, radius), color.scale_alpha(0.92));
+    for (radius_factor, offset_factor, alpha) in
+        [(0.70, 0.10, 0.14), (0.44, 0.24, 0.20), (0.18, 0.42, 0.34)]
+    {
+        frame.fill(
+            &Path::circle(
+                Point::new(
+                    center.x - radius * offset_factor,
+                    center.y - radius * offset_factor,
+                ),
+                radius * radius_factor,
+            ),
+            Color::WHITE.scale_alpha(alpha),
+        );
+    }
+}
+
+fn draw_trade_tooltip(
+    frame: &mut canvas::Frame,
+    bounds: Rectangle,
+    cursor: Point,
+    time: UnixMs,
+    trade: &GroupedTrade,
+    min_ticksize: exchange::unit::MinTicksize,
+    palette: &Palette,
+    three_dimensional: bool,
+) {
+    let width = 270.0_f32.min((bounds.width - 16.0).max(160.0));
+    let height = 116.0;
+    let x = if cursor.x + width + 12.0 <= bounds.width {
+        cursor.x + 12.0
+    } else {
+        cursor.x - width - 12.0
+    }
+    .clamp(8.0, (bounds.width - width - 8.0).max(8.0));
+    let y = (cursor.y - height * 0.5).clamp(8.0, (bounds.height - height - 8.0).max(8.0));
+    frame.fill(
+        &Path::rectangle(Point::new(x, y), Size::new(width, height)),
+        palette.background.weakest.color.scale_alpha(0.97),
+    );
+    let side = if trade.is_sell {
+        "Aggressive sell"
+    } else {
+        "Aggressive buy"
+    };
+    let timestamp = time
+        .format_utc("%Y-%m-%d %H:%M:%S%.3f UTC")
+        .unwrap_or_else(|| time.as_u64().to_string());
+    let lines = [
+        side.to_string(),
+        format!("Time       {timestamp}"),
+        format!("Price      {}", trade.price.to_string(min_ticksize)),
+        format!("Quantity   {}", abbr_large_numbers(trade.qty.to_f64())),
+        format!("Rendering  {}", if three_dimensional { "3D" } else { "2D" }),
+    ];
+    for (index, line) in lines.into_iter().enumerate() {
+        frame.fill_text(canvas::Text {
+            content: line,
+            position: Point::new(x + 10.0, y + 10.0 + index as f32 * 20.0),
+            size: iced::Pixels(if index == 0 { 13.0 } else { 11.0 }),
+            color: if index == 0 {
+                if trade.is_sell {
+                    palette.danger.strong.color
+                } else {
+                    palette.success.strong.color
+                }
+            } else {
+                palette.background.base.text
+            },
+            font: style::AZERET_MONO,
+            ..canvas::Text::default()
+        });
+    }
+}
+
+const DEFAULT_CELL_WIDTH: f32 = 3.0;
+
+const TOOLTIP_WIDTH: f32 = 204.0;
+const TOOLTIP_HEIGHT: f32 = 66.0;
+const TOOLTIP_PADDING: f32 = 12.0;
+const TOOLTIP_COL_GAP_PX: f32 = 2.0;
+
+const MAX_CIRCLE_RADIUS: f32 = 16.0;
+const CURRENT_DEPTH_AREA_WIDTH_PX: f32 = 160.0;
+const CURRENT_DEPTH_AREA_RIGHT_PAD_PX: f32 = 8.0;
+const CURRENT_DEPTH_LABEL_TOP_PAD_PX: f32 = 6.0;
+
+impl Chart for HeatmapChart {
+    type IndicatorKind = HeatmapIndicator;
+
+    fn state(&self) -> &ViewState {
+        &self.chart
+    }
+
+    fn mut_state(&mut self) -> &mut ViewState {
+        &mut self.chart
+    }
+
+    fn invalidate_crosshair(&mut self) {
+        self.chart.cache.clear_crosshair();
+    }
+
+    fn invalidate_all(&mut self) {
+        self.invalidate(None);
+    }
+
+    fn view_indicators(&'_ self, _indicators: &[Self::IndicatorKind]) -> Vec<Element<'_, Message>> {
+        vec![]
+    }
+
+    fn visible_timerange(&self) -> Option<(u64, u64)> {
+        let chart = self.state();
+        let region = chart.visible_region(chart.bounds.size());
+
+        if region.width == 0.0 {
+            return None;
+        }
+
+        Some((
+            chart.x_to_interval(region.x),
+            chart.x_to_interval(region.x + region.width),
+        ))
+    }
+
+    fn interval_keys(&self) -> Option<Vec<u64>> {
+        None
+    }
+
+    fn autoscaled_coords(&self) -> Vector {
+        let chart = self.state();
+        Vector::new(
+            0.5 * (chart.bounds.width / chart.scaling) - (90.0 / chart.scaling),
+            chart.translation.y,
+        )
+    }
+
+    fn supports_fit_autoscaling(&self) -> bool {
+        false
+    }
+
+    fn is_empty(&self) -> bool {
+        self.heatmap.is_empty()
+    }
+}
+
+impl PlotConstants for HeatmapChart {
+    fn min_scaling(&self) -> f32 {
+        MIN_SCALING
+    }
+
+    fn max_scaling(&self) -> f32 {
+        MAX_SCALING
+    }
+
+    fn max_cell_width(&self) -> f32 {
+        MAX_CELL_WIDTH
+    }
+
+    fn min_cell_width(&self) -> f32 {
+        MIN_CELL_WIDTH
+    }
+
+    fn max_cell_height(&self) -> f32 {
+        MAX_CELL_HEIGHT
+    }
+
+    fn min_cell_height(&self) -> f32 {
+        MIN_CELL_HEIGHT
+    }
+
+    fn default_cell_width(&self) -> f32 {
+        DEFAULT_CELL_WIDTH
+    }
+}
+
+#[derive(Default)]
+enum IndicatorData {
+    #[default]
+    Volume,
+}
+
+pub struct HeatmapChart {
+    chart: ViewState,
+    trades: TimeSeries<HeatmapDataPoint>,
+    indicators: EnumMap<HeatmapIndicator, Option<IndicatorData>>,
+    pause_buffer: Vec<(UnixMs, Box<[Trade]>, Depth)>,
+    heatmap: HistoricalDepth,
+    visual_config: Config,
+    study_configurator: study::Configurator<HeatmapStudy>,
+    last_tick: Instant,
+    pub studies: Vec<HeatmapStudy>,
+    iceberg_events: std::collections::VecDeque<IcebergEvent>,
+}
+
+impl HeatmapChart {
+    pub fn new(
+        layout: ViewConfig,
+        basis: Basis,
+        step: PriceStep,
+        enabled_indicators: &[HeatmapIndicator],
+        ticker_info: TickerInfo,
+        config: Option<Config>,
+        studies: Vec<HeatmapStudy>,
+    ) -> Self {
+        let (basis, timeframe) = data::chart::heatmap::normalize_basis(basis, ticker_info);
+        let mut indicators = EnumMap::default();
+        for &indicator in enabled_indicators {
+            indicators[indicator] = Some(match indicator {
+                HeatmapIndicator::Volume => IndicatorData::Volume,
+            });
+        }
+
+        let heatmap = HistoricalDepth::new(ticker_info.min_qty, step, timeframe);
+
+        let view_state = ViewState::new(
+            basis,
+            step,
+            ticker_info,
+            ViewConfig {
+                splits: layout.splits.clone(),
+                autoscale: Some(Autoscale::CenterLatest),
+            },
+            DEFAULT_CELL_WIDTH,
+            4.0,
+        );
+
+        HeatmapChart {
+            chart: view_state,
+            indicators,
+            pause_buffer: vec![],
+            heatmap,
+            trades: TimeSeries::<HeatmapDataPoint>::new(timeframe, step),
+            visual_config: config.unwrap_or_default(),
+            study_configurator: study::Configurator::new(),
+            studies,
+            last_tick: Instant::now(),
+            iceberg_events: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub fn insert_trades(&mut self, buffer: &[Trade], update_t: UnixMs) {
+        let rounded_update_t = self.round_to_basis_time(update_t);
+
+        let entry = self.trades.datapoints.entry(rounded_update_t).or_default();
+
+        let tick_size = self.chart.tick_size;
+        for trade in buffer {
+            entry.add_trade(trade, tick_size);
+        }
+    }
+
+    pub fn insert_depth(&mut self, depth: &Depth, update_t: UnixMs) {
+        let rounded_depth_update = self.round_to_basis_time(update_t);
+
+        let chart = &mut self.chart;
+
+        let mid_price = depth.mid_price().unwrap_or(chart.base_price_y);
+        chart.last_price = Some(PriceInfoLabel::Neutral(mid_price));
+
+        // if current orderbook not visible, pause the data insertion and buffer them instead
+        let is_paused = { chart.translation.x * chart.scaling > chart.bounds.width / 2.0 };
+
+        if is_paused {
+            self.pause_buffer.push((
+                rounded_depth_update,
+                Vec::<Trade>::new().into_boxed_slice(),
+                depth.clone(),
+            ));
+            return;
+        }
+
+        if !self.pause_buffer.is_empty() {
+            self.pause_buffer.sort_by_key(|(time, _, _)| *time);
+
+            for (time, _trades, depth) in std::mem::take(&mut self.pause_buffer) {
+                self.process_depth_at(time, &depth);
+            }
+        } else {
+            self.cleanup_old_data();
+        }
+
+        self.process_depth_at(rounded_depth_update, depth);
+    }
+
+    fn process_depth_at(&mut self, rounded_update: UnixMs, depth: &Depth) {
+        self.heatmap.insert_latest_depth(depth, rounded_update);
+
+        let chart = &mut self.chart;
+        let mid_price = depth.mid_price().unwrap_or(chart.base_price_y);
+        chart.base_price_y = mid_price.round_to_step(chart.tick_size);
+        chart.max_price = chart.max_price.max(chart.base_price_y);
+        chart.latest_x = chart.latest_x.max(rounded_update.as_u64());
+    }
+
+    fn cleanup_old_data(&mut self) {
+        if self.trades.datapoints.len() > CLEANUP_THRESHOLD {
+            let keys_to_remove = self
+                .trades
+                .datapoints
+                .keys()
+                .take(CLEANUP_THRESHOLD / 10)
+                .copied()
+                .collect::<Vec<UnixMs>>();
+
+            for key in keys_to_remove {
+                self.trades.datapoints.remove(&key);
+            }
+
+            if let Some(oldest_time) = self.trades.datapoints.keys().next().copied() {
+                self.heatmap.cleanup_old_price_levels(oldest_time);
+            }
+        }
+    }
+
+    fn round_to_basis_time(&self, update_t: UnixMs) -> UnixMs {
+        match self.chart.basis {
+            Basis::Time(interval) => update_t.floor_to(interval),
+            Basis::Tick(_) => update_t,
+        }
+    }
+
+    pub fn visual_config(&self) -> Config {
+        self.visual_config
+    }
+
+    pub fn insert_iceberg_event(&mut self, event: IcebergEvent) {
+        if !self.visual_config.iceberg_detector.enabled
+            || event.ticker_info != self.chart.ticker_info
+        {
+            return;
+        }
+        if let Some(existing) = self
+            .iceberg_events
+            .iter_mut()
+            .find(|existing| existing.id == event.id)
+        {
+            *existing = event;
+        } else {
+            self.iceberg_events.push_back(event);
+        }
+        let cutoff = self
+            .iceberg_events
+            .back()
+            .map(|event| {
+                event.last_updated_at.saturating_sub(
+                    u64::from(self.visual_config.iceberg_detector.retention_seconds) * 1_000,
+                )
+            })
+            .unwrap_or_default();
+        while self
+            .iceberg_events
+            .front()
+            .is_some_and(|event| event.last_updated_at < cutoff)
+        {
+            self.iceberg_events.pop_front();
+        }
+        self.invalidate(None);
+    }
+
+    pub fn detector_key(&self) -> crate::connector::iceberg::DetectorKey {
+        crate::connector::iceberg::DetectorKey {
+            ticker_info: self.chart.ticker_info,
+            tick_size: self.chart.tick_size,
+        }
+    }
+
+    pub fn set_visual_config(&mut self, visual_config: Config) {
+        self.visual_config = visual_config;
+        self.invalidate(Some(Instant::now()));
+    }
+
+    pub fn set_basis(&mut self, basis: Basis) {
+        let (basis, timeframe) =
+            data::chart::heatmap::normalize_basis(basis, self.chart.ticker_info);
+        self.chart.basis = basis;
+        self.chart.last_price = None;
+        self.chart.max_price = Price::from_f32(0.0);
+
+        self.trades.datapoints.clear();
+        self.heatmap = HistoricalDepth::new(
+            self.chart.ticker_info.min_qty,
+            self.chart.tick_size,
+            timeframe,
+        );
+
+        let chart = &mut self.chart;
+        chart.translation = Vector::new(
+            0.5 * (chart.bounds.width / chart.scaling) - (90.0 / chart.scaling),
+            0.0,
+        );
+
+        self.invalidate(None);
+    }
+
+    pub fn study_configurator(&self) -> &study::Configurator<HeatmapStudy> {
+        &self.study_configurator
+    }
+
+    pub fn update_study_configurator(&mut self, message: study::Message<HeatmapStudy>) {
+        let studies = &mut self.studies;
+
+        match self.study_configurator.update(message) {
+            Some(study::Action::ToggleStudy(study, is_selected)) => {
+                if is_selected {
+                    let already_exists = studies.iter().any(|s| s.is_same_type(&study));
+                    if !already_exists {
+                        studies.push(study);
+                    }
+                } else {
+                    studies.retain(|s| !s.is_same_type(&study));
+                }
+            }
+            Some(study::Action::ConfigureStudy(study)) => {
+                if let Some(existing_study) = studies.iter_mut().find(|s| s.is_same_type(&study)) {
+                    *existing_study = study;
+                }
+            }
+            None => {}
+        }
+
+        self.invalidate(None);
+    }
+
+    pub fn basis_interval(&self) -> Option<u64> {
+        match self.chart.basis {
+            Basis::Time(interval) => Some(interval.to_milliseconds()),
+            Basis::Tick(_) => None,
+        }
+    }
+
+    pub fn chart_layout(&self) -> ViewConfig {
+        self.chart.layout()
+    }
+
+    pub fn change_tick_size(&mut self, step: PriceStep) {
+        let chart_state = self.mut_state();
+
+        let (_, timeframe) =
+            data::chart::heatmap::normalize_basis(chart_state.basis, chart_state.ticker_info);
+
+        chart_state.cell_height = 4.0;
+        chart_state.tick_size = step;
+
+        self.trades.datapoints.clear();
+        self.heatmap = HistoricalDepth::new(self.chart.ticker_info.min_qty, step, timeframe);
+    }
+
+    pub fn tick_size(&self) -> PriceStep {
+        self.chart.tick_size
+    }
+
+    pub fn toggle_indicator(&mut self, indicator: HeatmapIndicator) {
+        if self.indicators[indicator].is_some() {
+            self.indicators[indicator] = None;
+        } else {
+            let data = match indicator {
+                HeatmapIndicator::Volume => IndicatorData::Volume,
+            };
+            self.indicators[indicator] = Some(data);
+        }
+    }
+
+    pub fn invalidate(&mut self, now: Option<Instant>) -> Option<super::Action> {
+        let chart = &mut self.chart;
+
+        if chart.layout.autoscale.is_some() {
+            chart.translation = Vector::new(
+                0.5 * (chart.bounds.width / chart.scaling) - (90.0 / chart.scaling),
+                0.0,
+            );
+        }
+
+        chart.cache.clear_all();
+
+        if let Some(t) = now {
+            self.last_tick = t;
+        }
+
+        None
+    }
+
+    pub fn last_update(&self) -> Instant {
+        self.last_tick
+    }
+
+    fn calc_qty_scales(
+        &self,
+        earliest: u64,
+        latest: u64,
+        highest: Price,
+        lowest: Price,
+    ) -> QtyScale {
+        let market_type = self.chart.ticker_info.market_type();
+
+        let (max_trade_qty, max_aggr_volume) = self
+            .trades
+            .max_trade_qty_and_aggr_volume(UnixMs::new(earliest), UnixMs::new(latest));
+
+        let max_depth_qty = self.heatmap.max_depth_qty_in_range(
+            UnixMs::new(earliest),
+            UnixMs::new(latest),
+            highest,
+            lowest,
+            market_type,
+            self.visual_config.order_size_filter,
+            self.visual_config.filter_unit,
+        );
+
+        QtyScale {
+            max_trade_qty,
+            max_aggr_volume,
+            max_depth_qty,
+        }
+    }
+}
+
+impl canvas::Program<Message> for HeatmapChart {
+    type State = Interaction;
+
+    fn update(
+        &self,
+        interaction: &mut Interaction,
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<Message>> {
+        super::canvas_interaction(self, interaction, event, bounds, cursor)
+    }
+
+    fn draw(
+        &self,
+        interaction: &Interaction,
+        renderer: &Renderer,
+        theme: &Theme,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let chart = self.state();
+
+        if chart.bounds.width == 0.0 {
+            return vec![];
+        }
+
+        let market_type = chart.ticker_info.market_type();
+
+        let bounds_size = bounds.size();
+        let palette = theme.palette();
+
+        let heatmap = chart.cache.main.draw(renderer, bounds_size, |frame| {
+            let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
+
+            frame.translate(center);
+            frame.scale(chart.scaling);
+            frame.translate(chart.translation);
+
+            let region = chart.visible_region(frame.size());
+
+            let (earliest, latest) = chart.interval_range(&region);
+            let (highest, lowest) = chart.price_range(&region);
+
+            if latest < earliest {
+                return;
+            }
+
+            let cell_height = chart.cell_height;
+            let qty_scales = self.calc_qty_scales(earliest, latest, highest, lowest);
+
+            let max_depth_qty = qty_scales.max_depth_qty.to_f64();
+            let max_aggr_volume = qty_scales.max_aggr_volume.to_f64();
+            let max_trade_qty = qty_scales.max_trade_qty.to_f64();
+
+            let size_in_quote_ccy = self.visual_config.filter_unit == SizeUnit::Quote;
+
+            let volume_indicator = self.indicators[HeatmapIndicator::Volume].is_some();
+
+            if let Some(merge_strat) = self.visual_config().coalescing {
+                let coalesced_visual_runs = self.heatmap.coalesced_runs(
+                    UnixMs::new(earliest),
+                    UnixMs::new(latest),
+                    highest,
+                    lowest,
+                    market_type,
+                    self.visual_config.order_size_filter,
+                    self.visual_config.filter_unit,
+                    merge_strat,
+                );
+
+                for (price_of_run, visual_run) in coalesced_visual_runs {
+                    let y_position = chart.price_to_y(price_of_run);
+
+                    let run_start_time_clipped = visual_run.start_time.max(UnixMs::new(earliest));
+                    let run_until_time_clipped = visual_run.until_time.min(UnixMs::new(latest));
+
+                    if run_start_time_clipped >= run_until_time_clipped {
+                        continue;
+                    }
+
+                    let start_x = chart.interval_to_x(run_start_time_clipped.as_u64());
+                    let end_x = chart
+                        .interval_to_x(run_until_time_clipped.as_u64())
+                        .min(0.0);
+
+                    let width = end_x - start_x;
+
+                    if width > 0.001 {
+                        let color_alpha = (visual_run.qty.to_f64() / max_depth_qty).min(1.0) as f32;
+
+                        frame.fill_rectangle(
+                            Point::new(start_x, y_position - (cell_height / 2.0)),
+                            Size::new(width, cell_height),
+                            depth_color(palette, visual_run.is_bid, color_alpha),
+                        );
+                    }
+                }
+            } else {
+                self.heatmap
+                    .iter_time_filtered(UnixMs::new(earliest), UnixMs::new(latest), highest, lowest)
+                    .for_each(|(price, runs)| {
+                        let y_position = chart.price_to_y(*price);
+
+                        runs.iter()
+                            .filter(|run| {
+                                let order_size = market_type.qty_in_quote_value(
+                                    run.qty,
+                                    *price,
+                                    size_in_quote_ccy,
+                                );
+                                order_size > f64::from(self.visual_config.order_size_filter)
+                            })
+                            .for_each(|run| {
+                                let start_x = chart.interval_to_x(
+                                    run.start_time.max(UnixMs::new(earliest)).as_u64(),
+                                );
+                                let end_x = chart
+                                    .interval_to_x(run.until_time.min(UnixMs::new(latest)).as_u64())
+                                    .min(0.0);
+
+                                let width = end_x - start_x;
+
+                                let color_alpha =
+                                    (run.qty.to_f64() / max_depth_qty).min(1.0) as f32;
+
+                                frame.fill_rectangle(
+                                    Point::new(start_x, y_position - (cell_height / 2.0)),
+                                    Size::new(width, cell_height),
+                                    depth_color(palette, run.is_bid, color_alpha),
+                                );
+                            });
+                    });
+            }
+
+            if let Some(latest_timestamp) = self.trades.latest_timestamp() {
+                let visible_space_right_of_zero = (region.x + region.width).max(0.0);
+                let desired_depth_area_width = CURRENT_DEPTH_AREA_WIDTH_PX / chart.scaling;
+                let current_depth_area_width =
+                    if desired_depth_area_width > visible_space_right_of_zero {
+                        let right_pad = CURRENT_DEPTH_AREA_RIGHT_PAD_PX / chart.scaling;
+                        (visible_space_right_of_zero - right_pad).max(0.0)
+                    } else {
+                        desired_depth_area_width
+                    };
+
+                let max_qty = self
+                    .heatmap
+                    .latest_order_runs(highest, lowest, latest_timestamp)
+                    .map(|(_, run)| run.qty.to_f32_lossy())
+                    .fold(f32::MIN, f32::max)
+                    .ceil()
+                    * 5.0
+                    / 5.0;
+
+                if max_qty.is_finite() && max_qty > 0.0 && current_depth_area_width > 0.0 {
+                    self.heatmap
+                        .latest_order_runs(highest, lowest, latest_timestamp)
+                        .for_each(|(price, run)| {
+                            let y_position = chart.price_to_y(*price);
+                            let bar_width =
+                                (run.qty.to_f32_lossy() / max_qty) * current_depth_area_width;
+
+                            frame.fill_rectangle(
+                                Point::new(0.0, y_position - (cell_height / 2.0)),
+                                Size::new(bar_width, cell_height),
+                                depth_color(palette, run.is_bid, 0.5),
+                            );
+                        });
+
+                    // max bid/ask quantity text
+                    let text_size = crate::style::text_size::TINY / chart.scaling;
+                    let text_content = abbr_large_numbers(max_qty as f64);
+
+                    let text_position = Point::new(
+                        current_depth_area_width,
+                        region.y + (CURRENT_DEPTH_LABEL_TOP_PAD_PX / chart.scaling),
+                    );
+
+                    frame.fill_text(canvas::Text {
+                        content: text_content,
+                        position: text_position,
+                        size: iced::Pixels(text_size),
+                        color: palette.background.base.text,
+                        font: style::AZERET_MONO,
+                        align_x: Alignment::End.into(),
+                        align_y: Alignment::Start.into(),
+                        ..canvas::Text::default()
+                    });
+                }
+            };
+
+            self.trades
+                .datapoints
+                .range(UnixMs::new(earliest)..=UnixMs::new(latest))
+                .for_each(|(time, dp)| {
+                    let x_position = chart.interval_to_x(time.as_u64());
+
+                    dp.grouped_trades.iter().for_each(|trade| {
+                        let y_position = chart.price_to_y(trade.price);
+                        let trade_qty = trade.qty.to_f64();
+
+                        let trade_size = market_type.qty_in_quote_value(
+                            trade.qty,
+                            trade.price,
+                            size_in_quote_ccy,
+                        );
+
+                        if trade_size > f64::from(self.visual_config.trade_size_filter) {
+                            let color = if trade.is_sell {
+                                palette.danger.base.color
+                            } else {
+                                palette.success.base.color
+                            };
+
+                            let radius = {
+                                if let Some(trade_size_scale) = self.visual_config.trade_size_scale
+                                {
+                                    let scale_factor = (trade_size_scale as f64) / 100.0;
+                                    (1.0_f64
+                                        + (trade_qty / max_trade_qty)
+                                            * f64::from(MAX_CIRCLE_RADIUS - 1.0)
+                                            * scale_factor)
+                                        as f32
+                                } else {
+                                    cell_height / 2.0
+                                }
+                            };
+
+                            draw_trade_bubble(
+                                frame,
+                                Point::new(x_position, y_position),
+                                radius,
+                                color,
+                                self.visual_config.trade_bubbles_3d,
+                                chart.scaling,
+                            );
+                        }
+                    });
+
+                    if volume_indicator {
+                        let bar_width = (chart.cell_width / 2.0) * 0.9;
+                        let area_height = (bounds.height / chart.scaling) * 0.1;
+
+                        let (buy_volume, sell_volume) = dp.buy_sell;
+
+                        super::draw_volume_bar(
+                            frame,
+                            x_position,
+                            (region.y + region.height) - area_height,
+                            buy_volume.to_f64(),
+                            sell_volume.to_f64(),
+                            max_aggr_volume,
+                            area_height,
+                            bar_width,
+                            palette.success.base.color,
+                            palette.danger.base.color,
+                            1.0,
+                            false,
+                        );
+                    }
+                });
+
+            if self.visual_config.iceberg_detector.enabled {
+                for event in self.iceberg_events.iter().filter(|event| {
+                    let time = event.confirmed_at.as_u64();
+                    time >= earliest
+                        && time <= latest
+                        && event.price >= lowest
+                        && event.price <= highest
+                }) {
+                    let x = chart.interval_to_x(event.confirmed_at.as_u64());
+                    let y = chart.price_to_y(event.price);
+                    let size = (4.0 + f32::from(event.score) / 20.0).min(9.0);
+                    let mut color = match event.side {
+                        IcebergSide::PossibleBuy => palette.success.strong.color,
+                        IcebergSide::PossibleSell => palette.danger.strong.color,
+                    };
+                    color.a *= match event.data_quality {
+                        exchange::orderflow::OrderFlowDataQuality::Healthy => 0.95,
+                        exchange::orderflow::OrderFlowDataQuality::Degraded => 0.55,
+                        exchange::orderflow::OrderFlowDataQuality::Synchronizing
+                        | exchange::orderflow::OrderFlowDataQuality::Gap => 0.25,
+                    };
+                    let mut builder = canvas::path::Builder::new();
+                    match event.side {
+                        IcebergSide::PossibleBuy => {
+                            builder.move_to(Point::new(x, y - size));
+                            builder.line_to(Point::new(x - size, y + size));
+                            builder.line_to(Point::new(x + size, y + size));
+                        }
+                        IcebergSide::PossibleSell => {
+                            builder.move_to(Point::new(x, y + size));
+                            builder.line_to(Point::new(x - size, y - size));
+                            builder.line_to(Point::new(x + size, y - size));
+                        }
+                    }
+                    builder.close();
+                    frame.fill(&builder.build(), color);
+                }
+            }
+
+            if volume_indicator && max_aggr_volume > 0.0 {
+                let text_size = crate::style::text_size::TINY / chart.scaling;
+                let text_content = abbr_large_numbers(max_aggr_volume);
+
+                let text_position = Point::new(
+                    region.x + region.width - 4.0,
+                    (region.y + region.height) - (bounds.height / chart.scaling) * 0.1 - text_size,
+                );
+
+                frame.fill_text(canvas::Text {
+                    content: text_content,
+                    position: text_position,
+                    size: text_size.into(),
+                    color: palette.background.base.text,
+                    font: style::AZERET_MONO,
+                    align_x: Alignment::End.into(),
+                    ..canvas::Text::default()
+                });
+            }
+
+            let volume_profile: Option<&ProfileKind> = self
+                .studies
+                .iter()
+                .map(|study| match study {
+                    HeatmapStudy::VolumeProfile(profile) => profile,
+                })
+                .next();
+
+            if let Some(profile_kind) = volume_profile {
+                let area_width = (bounds.width / chart.scaling) * 0.1;
+
+                let min_segment_width = 2.0;
+                let segments = ((area_width / min_segment_width).floor() as usize).clamp(10, 40);
+
+                for i in 0..segments {
+                    let segment_width = area_width / segments as f32;
+                    let segment_x = region.x + (i as f32 * segment_width);
+
+                    let alpha = 0.95 - (0.85 * (i as f32 / (segments - 1) as f32).powf(2.0));
+
+                    frame.fill_rectangle(
+                        Point::new(segment_x, region.y),
+                        Size::new(segment_width, region.height),
+                        palette.background.weakest.color.scale_alpha(alpha),
+                    );
+                }
+
+                draw_volume_profile(
+                    frame,
+                    &region,
+                    profile_kind,
+                    palette,
+                    chart,
+                    &self.trades,
+                    area_width,
+                );
+            }
+
+            let is_paused = chart.translation.x * chart.scaling > chart.bounds.width / 2.0;
+            if is_paused {
+                let bar_width = 8.0 / chart.scaling;
+                let bar_height = 32.0 / chart.scaling;
+                let padding = 24.0 / chart.scaling;
+
+                let total_icon_width = bar_width * 3.0;
+
+                let pause_bar = Rectangle {
+                    x: (region.x + region.width) - total_icon_width - padding,
+                    y: region.y + padding,
+                    width: bar_width,
+                    height: bar_height,
+                };
+
+                frame.fill_rectangle(
+                    pause_bar.position(),
+                    pause_bar.size(),
+                    palette.background.base.text.scale_alpha(0.4),
+                );
+
+                frame.fill_rectangle(
+                    pause_bar.position() + Vector::new(pause_bar.width * 2.0, 0.0),
+                    pause_bar.size(),
+                    palette.background.base.text.scale_alpha(0.4),
+                );
+            }
+        });
+
+        if !self.is_empty() {
+            let crosshair = chart.cache.crosshair.draw(renderer, bounds_size, |frame| {
+                if let Some(cursor_position) = cursor.position_in(bounds) {
+                    let (cursor_at_price, cursor_at_time) = chart.draw_crosshair(
+                        frame,
+                        theme,
+                        bounds_size,
+                        cursor_position,
+                        interaction,
+                    );
+
+                    if matches!(interaction, Interaction::Panning { .. })
+                        || matches!(interaction, Interaction::Ruler { start } if start.is_some())
+                    {
+                        return;
+                    }
+
+                    if self.visual_config.iceberg_detector.enabled
+                        && let Some(event) = self.iceberg_events.iter().min_by(|a, b| {
+                            let screen = |event: &IcebergEvent| {
+                                Point::new(
+                                    bounds.width / 2.0
+                                        + (chart.interval_to_x(event.confirmed_at.as_u64())
+                                            + chart.translation.x)
+                                            * chart.scaling,
+                                    bounds.height / 2.0
+                                        + (chart.price_to_y(event.price) + chart.translation.y)
+                                            * chart.scaling,
+                                )
+                            };
+                            screen(a)
+                                .distance(cursor_position)
+                                .total_cmp(&screen(b).distance(cursor_position))
+                        })
+                    {
+                        let marker = Point::new(
+                            bounds.width / 2.0
+                                + (chart.interval_to_x(event.confirmed_at.as_u64())
+                                    + chart.translation.x)
+                                    * chart.scaling,
+                            bounds.height / 2.0
+                                + (chart.price_to_y(event.price) + chart.translation.y)
+                                    * chart.scaling,
+                        );
+                        if marker.distance(cursor_position) <= 14.0 {
+                            let width = 350.0;
+                            let height = 218.0;
+                            let x = if cursor_position.x + width + 12.0 > bounds.width {
+                                cursor_position.x - width - 12.0
+                            } else {
+                                cursor_position.x + 12.0
+                            };
+                            let y = (cursor_position.y - height / 2.0)
+                                .clamp(4.0, (bounds.height - height - 4.0).max(4.0));
+                            frame.fill(
+                                &Path::rectangle(Point::new(x, y), Size::new(width, height)),
+                                palette.background.weakest.color.scale_alpha(0.96),
+                            );
+                            let title = match event.side {
+                                IcebergSide::PossibleBuy => "Possible Buy Iceberg Binance",
+                                IcebergSide::PossibleSell => "Possible Sell Iceberg Binance",
+                            };
+                            let aggressive = match event.side {
+                                IcebergSide::PossibleBuy => "Aggressive sells",
+                                IcebergSide::PossibleSell => "Aggressive buys",
+                            };
+                            let lines = [
+                                title.to_string(),
+                                format!("Price                     {:.8}", event.price.to_f64()),
+                                format!("Score                     {} / 100", event.score),
+                                format!(
+                                    "{aggressive:<25}{:.8}",
+                                    event.aggressive_executed_qty.to_f64()
+                                ),
+                                format!(
+                                    "Peak displayed            {:.8}",
+                                    event.peak_displayed_qty.to_f64()
+                                ),
+                                format!(
+                                    "Executed / displayed      {:.2}×",
+                                    event.executed_to_displayed
+                                ),
+                                format!(
+                                    "Replenished               {:.8}",
+                                    event.replenished_qty.to_f64()
+                                ),
+                                format!("Refill cycles              {}", event.refill_count),
+                                format!(
+                                    "Median refill latency     {}",
+                                    event
+                                        .median_refill_latency_ms
+                                        .map_or("-".to_string(), |value| format!("{value} ms"))
+                                ),
+                                format!(
+                                    "Adverse movement           {} ticks",
+                                    event.maximum_adverse_ticks
+                                ),
+                                format!(
+                                    "Hidden lower bound        {:.8}",
+                                    event.hidden_lower_bound_qty.to_f64()
+                                ),
+                                format!("Data quality              {:?}", event.data_quality),
+                            ];
+                            for (index, line) in lines.into_iter().enumerate() {
+                                frame.fill_text(canvas::Text {
+                                    content: line,
+                                    position: Point::new(x + 10.0, y + 10.0 + index as f32 * 16.5),
+                                    size: iced::Pixels(if index == 0 { 12.0 } else { 10.5 }),
+                                    color: palette.background.base.text,
+                                    font: style::AZERET_MONO,
+                                    ..canvas::Text::default()
+                                });
+                            }
+                            return;
+                        }
+                    }
+
+                    let visible_region = chart.visible_region(bounds_size);
+                    let (earliest, latest) = chart.interval_range(&visible_region);
+                    let (highest, lowest) = chart.price_range(&visible_region);
+                    let max_trade_qty = self
+                        .calc_qty_scales(earliest, latest, highest, lowest)
+                        .max_trade_qty
+                        .to_f64();
+                    let size_in_quote_ccy = self.visual_config.filter_unit == SizeUnit::Quote;
+                    let mut hovered_trade: Option<(f32, UnixMs, &GroupedTrade)> = None;
+                    for (time, dp) in self
+                        .trades
+                        .datapoints
+                        .range(UnixMs::new(earliest)..=UnixMs::new(latest))
+                    {
+                        for trade in dp.grouped_trades.iter() {
+                            if trade.price < lowest || trade.price > highest {
+                                continue;
+                            }
+                            let trade_size = market_type.qty_in_quote_value(
+                                trade.qty,
+                                trade.price,
+                                size_in_quote_ccy,
+                            );
+                            if trade_size <= f64::from(self.visual_config.trade_size_filter) {
+                                continue;
+                            }
+                            let radius = if let Some(scale) = self.visual_config.trade_size_scale {
+                                1.0 + (trade.qty.to_f64() / max_trade_qty.max(f64::EPSILON)) as f32
+                                    * (MAX_CIRCLE_RADIUS - 1.0)
+                                    * (scale as f32 / 100.0)
+                            } else {
+                                chart.cell_height * chart.scaling / 2.0
+                            };
+                            let center = Point::new(
+                                bounds.width / 2.0
+                                    + (chart.interval_to_x(time.as_u64()) + chart.translation.x)
+                                        * chart.scaling,
+                                bounds.height / 2.0
+                                    + (chart.price_to_y(trade.price) + chart.translation.y)
+                                        * chart.scaling,
+                            );
+                            let distance = center.distance(cursor_position);
+                            if distance <= radius.max(4.0) + 3.0
+                                && hovered_trade
+                                    .as_ref()
+                                    .is_none_or(|(best, _, _)| distance < *best)
+                            {
+                                hovered_trade = Some((distance, *time, trade));
+                            }
+                        }
+                    }
+                    if let Some((_, time, trade)) = hovered_trade {
+                        draw_trade_tooltip(
+                            frame,
+                            bounds,
+                            cursor_position,
+                            time,
+                            trade,
+                            chart.ticker_info.min_ticksize,
+                            palette,
+                            self.visual_config.trade_bubbles_3d,
+                        );
+                        return;
+                    }
+
+                    let interval = match chart.basis {
+                        Basis::Time(interval) => interval,
+                        Basis::Tick(_) => return,
+                    };
+                    let step = chart.tick_size;
+
+                    let base_data_price = cursor_at_price.round_to_step(step);
+                    let base_data_time = UnixMs::new(cursor_at_time).floor_to(interval);
+
+                    let price_tick_offsets = [1i64, 0, -1];
+                    let time_interval_offsets = [-1i64, 0, 1, 2];
+
+                    let prices_for_display_lookup: [Price; 3] = std::array::from_fn(|i| {
+                        let offset = price_tick_offsets[i];
+                        base_data_price.add_steps(offset, step)
+                    });
+                    let times_for_display_lookup: [UnixMs; 4] = std::array::from_fn(|i| {
+                        let offset = time_interval_offsets[i];
+                        base_data_time.offset_by_timeframe(interval, offset)
+                    });
+
+                    let display_grid_qtys: FxHashMap<(UnixMs, Price), (exchange::unit::Qty, bool)> =
+                        self.heatmap.query_grid_qtys(
+                            base_data_time,
+                            base_data_price,
+                            &time_interval_offsets,
+                            &price_tick_offsets,
+                            market_type,
+                            self.visual_config.order_size_filter,
+                            self.visual_config.filter_unit,
+                            self.visual_config.coalescing,
+                        );
+
+                    if display_grid_qtys.is_empty() {
+                        return;
+                    }
+
+                    let should_draw_below = cursor_position.y < TOOLTIP_HEIGHT + TOOLTIP_PADDING;
+                    let should_draw_left =
+                        cursor_position.x > bounds.width - (TOOLTIP_WIDTH + TOOLTIP_PADDING);
+
+                    let overlay_top_left_x = if should_draw_left {
+                        cursor_position.x - TOOLTIP_WIDTH - TOOLTIP_PADDING
+                    } else {
+                        cursor_position.x + TOOLTIP_PADDING
+                    };
+
+                    let overlay_top_left_y = if should_draw_below {
+                        cursor_position.y + TOOLTIP_PADDING
+                    } else {
+                        cursor_position.y - TOOLTIP_HEIGHT - TOOLTIP_PADDING
+                    };
+
+                    let overlay_background = Path::rectangle(
+                        Point::new(overlay_top_left_x, overlay_top_left_y),
+                        Size::new(TOOLTIP_WIDTH, TOOLTIP_HEIGHT),
+                    );
+                    frame.fill(
+                        &overlay_background,
+                        palette.background.weakest.color.scale_alpha(0.9),
+                    );
+
+                    let col_count = time_interval_offsets.len() as f32;
+                    let cell_width_overlay =
+                        (TOOLTIP_WIDTH - ((col_count - 1.0) * TOOLTIP_COL_GAP_PX)) / col_count;
+                    let cell_height_overlay = TOOLTIP_HEIGHT / 3.0;
+
+                    let palette = theme.palette();
+                    for (display_row_idx, &data_price_key) in
+                        prices_for_display_lookup.iter().enumerate()
+                    {
+                        for (display_col_idx, &data_time_val) in
+                            times_for_display_lookup.iter().enumerate()
+                        {
+                            if let Some((qty, is_bid)) =
+                                display_grid_qtys.get(&(data_time_val, data_price_key))
+                            {
+                                let text_content = abbr_large_numbers(qty.to_f64());
+                                let color = if *is_bid {
+                                    palette.success.strong.color
+                                } else {
+                                    palette.danger.strong.color
+                                };
+
+                                let text_pos_x = overlay_top_left_x
+                                    + (display_col_idx as f32
+                                        * (cell_width_overlay + TOOLTIP_COL_GAP_PX))
+                                    + cell_width_overlay / 2.0;
+                                let text_pos_y = overlay_top_left_y
+                                    + (display_row_idx as f32 * cell_height_overlay)
+                                    + cell_height_overlay / 2.0;
+
+                                frame.fill_text(canvas::Text {
+                                    content: text_content,
+                                    position: Point::new(text_pos_x, text_pos_y),
+                                    size: iced::Pixels(crate::style::text_size::TINY),
+                                    color,
+                                    font: style::AZERET_MONO,
+                                    align_y: Alignment::Center.into(),
+                                    align_x: Alignment::Center.into(),
+                                    ..canvas::Text::default()
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+
+            vec![heatmap, crosshair]
+        } else {
+            vec![heatmap]
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        interaction: &Interaction,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        match interaction {
+            Interaction::Panning { .. } => mouse::Interaction::Grabbing,
+            Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
+            Interaction::None | Interaction::Ruler { .. } => {
+                if cursor.is_over(bounds) {
+                    return mouse::Interaction::Crosshair;
+                }
+                mouse::Interaction::default()
+            }
+        }
+    }
+}
+
+fn depth_color(palette: &Palette, is_bid: bool, alpha: f32) -> Color {
+    if is_bid {
+        palette.success.strong.color.scale_alpha(alpha)
+    } else {
+        palette.danger.strong.color.scale_alpha(alpha)
+    }
+}
+
+fn draw_volume_profile(
+    frame: &mut canvas::Frame,
+    region: &Rectangle,
+    kind: &ProfileKind,
+    palette: &Palette,
+    chart: &ViewState,
+    timeseries: &TimeSeries<HeatmapDataPoint>,
+    area_width: f32,
+) {
+    let (highest, lowest) = chart.price_range(region);
+
+    let (time_start, time_end) = match kind {
+        ProfileKind::VisibleRange => {
+            let earliest = chart.x_to_interval(region.x);
+            let latest = chart.x_to_interval(region.x + region.width);
+            (earliest, latest)
+        }
+        ProfileKind::FixedWindow(datapoints) => {
+            let basis_interval = match chart.basis {
+                Basis::Time(interval) => interval.to_milliseconds(),
+                Basis::Tick(_) => return,
+            };
+
+            let latest = chart
+                .latest_x
+                .min(chart.x_to_interval(region.x + region.width));
+            let earliest = latest.saturating_sub((*datapoints as u64) * basis_interval);
+
+            (earliest, latest)
+        }
+    };
+
+    let step = chart.tick_size;
+
+    let first_tick = lowest.round_to_side_step(false, step);
+    let last_tick = highest.round_to_side_step(true, step);
+
+    let num_ticks = match Price::steps_between_inclusive(first_tick, last_tick, step) {
+        Some(n) => n,
+        None => return,
+    };
+
+    if num_ticks > 4096 {
+        return;
+    }
+
+    let mut profile = vec![(0.0f64, 0.0f64); num_ticks];
+    let mut max_aggr_volume = 0.0f64;
+
+    timeseries
+        .datapoints
+        .range(UnixMs::new(time_start)..=UnixMs::new(time_end))
+        .for_each(|(_, dp)| {
+            dp.grouped_trades
+                .iter()
+                .filter(|trade| trade.price >= lowest && trade.price <= highest)
+                .for_each(|trade| {
+                    let grouped_price = trade.price.round_to_side_step(trade.is_sell, step);
+
+                    if grouped_price.units < first_tick.units
+                        || grouped_price.units > last_tick.units
+                    {
+                        return;
+                    }
+
+                    let index = ((grouped_price.units - first_tick.units) / step.units) as usize;
+
+                    if let Some(entry) = profile.get_mut(index) {
+                        let trade_qty = trade.qty.to_f64();
+                        if trade.is_sell {
+                            entry.1 += trade_qty;
+                        } else {
+                            entry.0 += trade_qty;
+                        }
+                        max_aggr_volume = max_aggr_volume.max(entry.0 + entry.1);
+                    }
+                });
+        });
+
+    profile
+        .iter()
+        .enumerate()
+        .for_each(|(index, (buy_v, sell_v))| {
+            if *buy_v > 0.0 || *sell_v > 0.0 {
+                let price = first_tick.add_steps(index as i64, step);
+                let y_position = chart.price_to_y(price);
+
+                let next_price = price.add_steps(1, step);
+                let next_y_position = chart.price_to_y(next_price);
+                let bar_height = (next_y_position - y_position).abs();
+
+                super::draw_volume_bar(
+                    frame,
+                    region.x,
+                    y_position,
+                    *buy_v,
+                    *sell_v,
+                    max_aggr_volume,
+                    area_width,
+                    bar_height,
+                    palette.success.weak.color,
+                    palette.danger.weak.color,
+                    1.0,
+                    true,
+                );
+            }
+        });
+
+    if max_aggr_volume > 0.0 {
+        let text_size = crate::style::text_size::TINY / chart.scaling;
+        let text_content = abbr_large_numbers(max_aggr_volume);
+
+        let text_position = Point::new(region.x + area_width, region.y);
+
+        frame.fill_text(canvas::Text {
+            content: text_content,
+            position: text_position,
+            size: iced::Pixels(text_size),
+            color: palette.background.base.text,
+            font: style::AZERET_MONO,
+            ..canvas::Text::default()
+        });
+    }
+}
